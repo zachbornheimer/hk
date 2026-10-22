@@ -1,6 +1,6 @@
 ---
 description: Learn the Pkl ye need to draw hk's charts, muster the same hands across hooks, and find out why the charts won't evaluate.
-sourceHash: c57a31617e07
+sourceHash: bbbb7101b387
 ---
 
 # Pkl essentials for the chart room
@@ -229,7 +229,7 @@ hk sails with [pklr](https://github.com/jdx/pklr) built in, and always uses it t
 
 The built-in evaluator lays up the packages it downloads in its locker for later runs, and stocks that locker from the start with the Pkl package matching the running hk version. Use [`HK_PKL_OFFLINE`](/environment_variables#hk-pkl-offline) to require cached or embedded packages, with no network access: no boats go ashore.
 
-Release builds cache the evaluated configuration; debug builds turn this cache off by default. The values of environment variables (the standing orders) that the configuration reads with `read("env:NAME")` or `read?("env:NAME")` are part of the cache key. hk re-evaluates the configuration only when no cache entry exists for the current values; set a variable back to an earlier value, and hk reuses that entry. Files read as resources, such as `read("data.txt")`, are not tracked: change one, and the cache won't notice. When the charts give ye an unexpected result after ye change an import or an evaluation input, bypass the cache or clear it:
+Release builds cache the evaluated configuration; debug builds turn this cache off by default. The values of environment variables (the standing orders) that the configuration reads with `read("env:NAME")` or `read?("env:NAME")` are part of the cache key. hk re-evaluates the configuration only when no cache entry exists for the current values; set a variable back to an earlier value, and hk reuses that entry. Files read as resources, such as `read("data.txt")` or `read("file:///path")`, and modules imported from `http://` or `https://` URLs are not tracked: change one, and the cache won't notice until ye clear it. Yer [user configuration](/configuration#hkrc) is cached the same way, in one entry shared by every ship. When the charts give ye an unexpected result after ye change an import or an evaluation input, bypass the cache or clear it:
 
 ```sh
 HK_CACHE=0 hk validate
