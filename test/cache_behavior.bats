@@ -727,3 +727,410 @@ EOF
     assert_output --partial "value=[one] count=0"
     assert_output --partial "config.load:config.load_project:cache.get: cache.hit"
 }
+
+# The user config, $HOME/.config/hk/config.pkl here, is merged under the
+# project config and is cached on its own, like a project config.
+
+write_project_config() {
+    cat <<EOF > hk.pkl
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["project"] { check = "echo project-ran" }
+}
+EOF
+}
+
+# The config comes from stdin.
+write_user_config() {
+    mkdir -p "$HOME/.config/hk"
+    cat > "$HOME/.config/hk/config.pkl"
+}
+
+user_cache_files() {
+    find "$HK_CACHE_DIR/configs" -name "user-*.json" -type f
+}
+
+@test "user config is cached and reused on later runs" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "project-ran"
+    assert_output --partial "global-ran"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "project-ran"
+    assert_output --partial "global-ran"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+    refute_output --partial "config.load:config.load_user:cache.get: cache.miss"
+}
+
+@test "user config cache is shared by every project" {
+    export HK_CACHE=1
+    mkdir repo1 repo2
+    for repo in repo1 repo2; do
+        cat <<EOF > "$repo/hk.pkl"
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["$repo"] { check = "echo $repo" }
+}
+EOF
+    done
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+
+    run bash -c "cd repo1 && hk validate -vv"
+    assert_success
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    run bash -c "cd repo2 && hk validate -vv"
+    assert_success
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+    [ "$(user_cache_files | wc -l | tr -d ' ')" -eq 1 ]
+}
+
+@test "user config cache invalidates when the config or a module it imports changes" {
+    export HK_CACHE=1
+    write_project_config
+    cat <<EOF > "$TEST_TEMP_DIR/shared.pkl"
+WORD = "one"
+EOF
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+import "$TEST_TEMP_DIR/shared.pkl"
+steps {
+    ["global"] { check = "echo global-\(shared.WORD)" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check test.txt
+    assert_success
+    assert_output --partial "global-one"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "global-one"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+
+    # An edit to an imported module reaches the config without touching it
+    echo 'WORD = "two"' > "$TEST_TEMP_DIR/shared.pkl"
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "global-two"
+    refute_output --partial "global-one"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    # So does an edit to the config itself
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+import "$TEST_TEMP_DIR/shared.pkl"
+steps {
+    ["global"] { check = "echo edited-\(shared.WORD)" }
+}
+EOF
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "edited-two"
+    refute_output --partial "global-two"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    # ...and the refreshed config is itself cached
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "edited-two"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+}
+
+@test "user config cache is keyed on the env vars the user config reads" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo value=[\(read?("env:HK_TEST_VAR") ?? "unset")]" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check test.txt
+    assert_success
+    assert_output --partial "value=[unset]"
+
+    HK_TEST_VAR=one run hk check test.txt
+    assert_success
+    assert_output --partial "value=[one]"
+
+    HK_TEST_VAR=one run hk check -vv test.txt
+    assert_success
+    assert_output --partial "value=[one]"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+
+    # An empty value is not the same as an unset one
+    HK_TEST_VAR= run hk check -vv test.txt
+    assert_success
+    assert_output --partial "value=[]"
+    assert_output --partial "config.load:config.load_user: cache.write"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "value=[unset]"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+}
+
+@test "user config cache is keyed on HK_PKL_HTTP_REWRITE" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    # A rewrite changes what the config's modules resolve to
+    HK_PKL_HTTP_REWRITE="https://example.com/=https://mirror.example.com/" run hk check -vv test.txt
+    assert_success
+    assert_output --partial "global-ran"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+}
+
+@test "user config sees env vars exported by the project config" {
+    export HK_CACHE=1
+    cat <<EOF > hk.pkl
+amends "$PKL_PATH/Config.pkl"
+env {
+    ["HK_TEST_VAR"] = "exported"
+}
+EOF
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo value=[\(read?("env:HK_TEST_VAR") ?? "unset")]" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check test.txt
+    assert_success
+    assert_output --partial "value=[exported]"
+
+    HK_TEST_VAR=other run hk check -vv test.txt
+    assert_success
+    assert_output --partial "value=[exported]"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+}
+
+@test "legacy user config is rejected on every run and never cached" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+environment = new Mapping<String, String> { ["OLD"] = "1" }
+EOF
+    echo "test" > test.txt
+
+    for _ in 1 2; do
+        run hk check -vv test.txt
+        assert_failure
+        assert_output --partial 'rename `environment` to `env`'
+        refute_output --partial "config.load:config.load_user:cache.get: cache.hit"
+    done
+    [ -z "$(user_cache_files)" ]
+}
+
+@test "user config min_hk_version fails on every run and is never cached" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+min_hk_version = "99.0.0"
+EOF
+    echo "test" > test.txt
+
+    for _ in 1 2; do
+        run hk check test.txt
+        assert_failure
+        assert_output --partial "less than the minimum required version 99.0.0"
+    done
+    [ -z "$(user_cache_files)" ]
+}
+
+@test "a cached user config is initialized on every hit" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+    run hk check test.txt
+    assert_success
+
+    # An entry that init rejects, as if it had been written by a build that
+    # accepted it, must not be used as it is
+    entry="$(user_cache_files)"
+    sed -E 's/"min_hk_version":("[^"]*"|null)/"min_hk_version":"99.0.0"/' "$entry" > "$entry.edited"
+    mv "$entry.edited" "$entry"
+    grep -q '"min_hk_version":"99.0.0"' "$entry"
+
+    run hk check -vv test.txt
+    assert_failure
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+    assert_output --partial "less than the minimum required version 99.0.0"
+}
+
+@test "a cached user config resolves the same as a fresh evaluation" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+exclude = Regex(#"^vendor/"#)
+hide_warnings = List("missing-profiles")
+env {
+    ["HK_TEST_GLOBAL"] = "loaded"
+}
+steps {
+    ["global"] {
+        glob = List("**/*.txt", "**/*.md")
+        profiles = List("slow")
+        env { ["HK_TEST_STEP"] = "1" }
+        check = "echo global-ran {{files}}"
+    }
+}
+hooks {
+    ["check"] {
+        steps {
+            ["hooked"] { check = "echo hooked" }
+        }
+    }
+}
+EOF
+    echo "test" > test.txt
+
+    # First run misses, second hits, third skips the cache. Each run has to
+    # resolve to the same plan, apart from when it was generated. The plans
+    # live outside the repository so they are not among the files it matches.
+    plan() {
+        hk check --slow --plan --json 2>/dev/null | grep -v '"generatedAt"'
+    }
+    plan > "$TEST_TEMP_DIR/miss.json"
+    grep -q '"global"' "$TEST_TEMP_DIR/miss.json"
+    grep -q '"hooked"' "$TEST_TEMP_DIR/miss.json"
+    plan > "$TEST_TEMP_DIR/hit.json"
+    HK_CACHE=0 plan > "$TEST_TEMP_DIR/fresh.json"
+    diff "$TEST_TEMP_DIR/miss.json" "$TEST_TEMP_DIR/hit.json"
+    diff "$TEST_TEMP_DIR/miss.json" "$TEST_TEMP_DIR/fresh.json"
+}
+
+@test "HK_CACHE=0 evaluates the user config on every run" {
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+
+    for _ in 1 2; do
+        HK_CACHE=0 run hk check -vv test.txt
+        assert_success
+        assert_output --partial "global-ran"
+        assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+        refute_output --partial "config.load:config.load_user:cache.get: cache.hit"
+    done
+}
+
+@test "a corrupted user config cache entry is replaced" {
+    export HK_CACHE=1
+    write_project_config
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+
+    run hk check test.txt
+    assert_success
+    [ "$(user_cache_files | wc -l | tr -d ' ')" -eq 1 ]
+    printf '{"steps":' > "$(user_cache_files)"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "failed to parse cache file"
+    assert_output --partial "global-ran"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.miss"
+
+    run hk check -vv test.txt
+    assert_success
+    assert_output --partial "global-ran"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+}
+
+@test "user, project and subproject configs keep separate cache entries" {
+    export HK_CACHE=1
+    cat <<EOF > hk.pkl
+amends "$PKL_PATH/Config.pkl"
+subprojects = List("sub")
+steps {
+    ["project"] { check = "echo project-ran" }
+}
+EOF
+    mkdir sub
+    cat <<EOF > sub/hk.pkl
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["sub"] { check = "echo sub-ran" }
+}
+EOF
+    write_user_config <<EOF
+amends "$PKL_PATH/Config.pkl"
+steps {
+    ["global"] { check = "echo global-ran" }
+}
+EOF
+    echo "test" > test.txt
+    echo "test" > sub/test.txt
+
+    for _ in 1 2; do
+        run hk check -vv test.txt sub/test.txt
+        assert_success
+        assert_output --partial "project-ran"
+        assert_output --partial "sub-ran"
+        assert_output --partial "global-ran"
+    done
+    assert_output --partial "config.load:config.load_project:cache.get: cache.hit"
+    assert_output --partial "config.load:cache.get: cache.hit"
+    assert_output --partial "config.load:config.load_user:cache.get: cache.hit"
+
+    [ "$(find "$HK_CACHE_DIR/configs" -name "resolved-config-*.json" -type f | wc -l | tr -d ' ')" -eq 1 ]
+    [ "$(user_cache_files | wc -l | tr -d ' ')" -eq 1 ]
+}

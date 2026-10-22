@@ -453,4 +453,15 @@ mod tests {
 
         assert!(format!("{err:#}").contains(&cache.cache_file_path.display().to_string()));
     }
+
+    #[test]
+    fn entries_are_keyed_on_the_hk_version() {
+        let builder = CacheManagerBuilder::new("entry.json");
+        let mut other = builder.clone();
+        other
+            .cache_keys
+            .retain(|key| key != env!("CARGO_PKG_VERSION"));
+
+        assert_ne!(builder.cache_key(), other.cache_key());
+    }
 }
