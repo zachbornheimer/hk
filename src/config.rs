@@ -11,6 +11,26 @@ use eyre::{WrapErr, bail, eyre};
 
 pub const V2_MIGRATION_URL: &str = "https://hk.jdx.dev/migration-v2";
 
+/// Where a config file sits in the hierarchy. The layer decides what loading
+/// the file does to the hk process and which cache slot holds the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigLayer {
+    /// The project config. Its `env` is exported to the hk process, and while
+    /// every import is a local file its result is shared by content.
+    Root,
+    /// A subproject config. Its `env` stays scoped to its own steps.
+    Subproject,
+    /// The user config in `HK_CONFIG_DIR`, merged under the project config. Its
+    /// `env` is applied by `merge_from_hkrc`, so that the project's wins.
+    User,
+}
+
+impl ConfigLayer {
+    fn exports_env(self) -> bool {
+        self == Self::Root
+    }
+}
+
 impl Config {
     /// Return the resolved config for this hk invocation.
     ///
@@ -43,9 +63,10 @@ impl Config {
     /// Also returns every environment variable the evaluation read, with the
     /// value it saw.
     #[tracing::instrument(level = "info", name = "config.read", skip_all, fields(path = %path.display()))]
-    fn read(path: &Path, apply_env: bool) -> Result<(Self, EnvReads)> {
+    fn read(path: &Path, layer: ConfigLayer) -> Result<(Self, EnvReads)> {
         let ext = path.extension().unwrap_or_default().to_str().unwrap();
         let (mut config, env_reads): (Config, _) = match ext {
+            "pkl" if layer == ConfigLayer::User => eval_user_pklr(path)?,
             "pkl" => eval_pklr(path)?,
             "toml" | "yaml" | "yml" | "json" => bail!(
                 "{} configuration was removed in hk v2; convert {} to hk.pkl and amend Config.pkl\n\nSee {}",
@@ -57,7 +78,7 @@ impl Config {
                 "Unsupported config extension: {ext}; hk v2 requires a Pkl config\n\nSee {V2_MIGRATION_URL}"
             ),
         };
-        config.init(path, apply_env)?;
+        config.init(path, layer.exports_env())?;
         Ok((config, env_reads))
     }
 
@@ -310,7 +331,7 @@ impl Config {
         if env::HK_FILE.is_none()
             && let Some(path) = Self::find_project_config(&Self::legacy_project_config_paths())
         {
-            let mut config = Self::read(&path, true)?.0;
+            let mut config = Self::read(&path, ConfigLayer::Root)?.0;
             config.project_config_loaded = true;
             return Ok(config);
         }
@@ -464,14 +485,16 @@ impl Config {
     }
 
     fn load_config_cached(path: PathBuf) -> Result<Config> {
-        Self::load_config_cached_with(path, true)
+        Self::load_config_cached_with(path, ConfigLayer::Root)
     }
 
-    /// Load a config file with caching. `is_root` controls whether the config's
-    /// `env` is exported to the hk process (root config only) and whether the
-    /// shared `resolved-config.json` cache slot may be used — subproject configs
-    /// always get a path-keyed cache file so they don't thrash the root's slot.
-    fn load_config_cached_with(path: PathBuf, is_root: bool) -> Result<Config> {
+    /// Load a config file with caching. `layer` decides whether the config's
+    /// `env` is exported to the hk process and which cache file holds the
+    /// result. Only the root config may use the shared `resolved-config.json`
+    /// slot; subproject and user configs always get a path-keyed cache file so
+    /// they don't thrash it, and the user config's file is its own so that a
+    /// hit can never skip the checks `eval_user_pklr` makes on a miss.
+    fn load_config_cached_with(path: PathBuf, layer: ConfigLayer) -> Result<Config> {
         let hash_key = format!("{}.json", hash::hash_to_str(&path));
         let cache_dir = env::HK_CACHE_DIR.join("configs");
 
@@ -524,10 +547,10 @@ impl Config {
 
         // Key the config cache on all fresh files (imports + main config) and
         // on the env vars the config reads
-        let config_cache_path = if has_untracked_imports || !is_root {
-            cache_dir.join(hash_key)
-        } else {
-            cache_dir.join("resolved-config.json")
+        let config_cache_path = match layer {
+            ConfigLayer::Root if !has_untracked_imports => cache_dir.join("resolved-config.json"),
+            ConfigLayer::User => cache_dir.join(format!("user-{hash_key}")),
+            ConfigLayer::Root | ConfigLayer::Subproject => cache_dir.join(hash_key),
         };
         let config_cache_builder = CacheManagerBuilder::new(config_cache_path)
             .with_cache_key(pkl_http_rewrite_cache_key());
@@ -556,7 +579,7 @@ impl Config {
         let mut config = match build_config_cache_mgr(&env_values).get() {
             Some(config) => config,
             None => {
-                let (config, env_reads) = Self::read(&path, is_root).map_err(|err| {
+                let (config, env_reads) = Self::read(&path, layer).map_err(|err| {
                     // A syntax error already names its own file, line and column.
                     if err.downcast_ref::<PklSyntaxError>().is_some() {
                         err
@@ -581,10 +604,11 @@ impl Config {
                 config
             }
         };
-        config.init(&path, is_root)?;
+        config.init(&path, layer.exports_env())?;
         Ok(config)
     }
 
+    #[tracing::instrument(level = "info", name = "config.load_user", skip_all)]
     fn apply_hkrc(&mut self) -> Result<()> {
         let project_path = Self::project_root_of(&self.path).join(".hkrc.pkl");
         if project_path.exists() {
@@ -605,19 +629,10 @@ impl Config {
         let hkrc_path = xdg_path.exists().then_some(xdg_path);
 
         if let Some(path) = hkrc_path {
-            // Parse pkl output as raw JSON for format detection
-            let json_value: serde_json::Value = run_pklr(&path)?;
-
-            if json_value.get("environment").is_some() || json_value.get("defaults").is_some() {
-                bail!(
-                    "UserConfig.pkl was removed in hk v2; amend Config.pkl, rename `environment` to `env`, and move settings from `defaults` to the top level (for example `jobs`, `skip_steps`, `skip_hooks`, and `profiles`)\n\nSee {V2_MIGRATION_URL}"
-                );
-            }
-            let mut hkrc_config: Config = serde_json::from_value(json_value)
-                .map_err(|e| handle_pklr_deserialize_error(&e.to_string(), &path))?;
-            // The project config has already exported its environment. Do not
-            // overwrite it before the project-wins merge below.
-            hkrc_config.init(&path, false)?;
+            // Loading the user config leaves its environment unexported: the
+            // project config has already exported its own, and the user's must
+            // not overwrite it before the project-wins merge below.
+            let mut hkrc_config = Self::load_config_cached_with(path, ConfigLayer::User)?;
             hkrc_config.materialize_default_hooks()?;
             self.merge_from_hkrc(hkrc_config)?;
         }
@@ -763,7 +778,7 @@ impl Config {
         let implicit_root = Self::implicit_root_dir(&self.path);
         for (dir, config_path) in Self::discover_subprojects(&root, &patterns)? {
             debug!("loading subproject config: {}", config_path.display());
-            let sub = Self::load_config_cached_with(config_path.clone(), false)?;
+            let sub = Self::load_config_cached_with(config_path.clone(), ConfigLayer::Subproject)?;
             self.merge_subproject(&dir, implicit_root.as_deref(), sub)
                 .wrap_err_with(|| {
                     format!(
@@ -1132,10 +1147,6 @@ fn embedded_pkl_package_url() -> String {
     format!("https://github.com/jdx/hk/releases/download/v{version}/hk@{version}.zip")
 }
 
-fn run_pklr<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    Ok(eval_pklr(path)?.0)
-}
-
 /// Environment variables an evaluation read, with the value it saw; `None`
 /// when unset.
 type EnvReads = BTreeMap<String, Option<String>>;
@@ -1165,6 +1176,21 @@ fn eval_pklr<T: DeserializeOwned>(path: &Path) -> Result<(T, EnvReads)> {
     let value = serde_json::from_value(outcome.json)
         .map_err(|e| handle_pklr_deserialize_error(&e.to_string(), path))?;
     Ok((value, outcome.env_reads))
+}
+
+/// Evaluate the user config. A v1 `UserConfig` file evaluates without error
+/// but is not a `Config`, so it is rejected from the raw output, before
+/// deserializing drops the properties hk does not know.
+fn eval_user_pklr(path: &Path) -> Result<(Config, EnvReads)> {
+    let (json, env_reads): (serde_json::Value, _) = eval_pklr(path)?;
+    if json.get("environment").is_some() || json.get("defaults").is_some() {
+        bail!(
+            "UserConfig.pkl was removed in hk v2; amend Config.pkl, rename `environment` to `env`, and move settings from `defaults` to the top level (for example `jobs`, `skip_steps`, `skip_hooks`, and `profiles`)\n\nSee {V2_MIGRATION_URL}"
+        );
+    }
+    let config = serde_json::from_value(json)
+        .map_err(|e| handle_pklr_deserialize_error(&e.to_string(), path))?;
+    Ok((config, env_reads))
 }
 
 /// Keeps an unset variable distinct from an empty one. The values only ever
