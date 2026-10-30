@@ -4,9 +4,9 @@ setup() {
     load 'test_helper/common_setup'
     _common_setup
     TEST_REPO_DIR="$(temp_make)"
-    pushd "$TEST_REPO_DIR"
+    pushd "$TEST_REPO_DIR" || exit
     git init --bare
-    popd
+    popd || exit
     git remote add origin "$TEST_REPO_DIR"
 }
 teardown() {
