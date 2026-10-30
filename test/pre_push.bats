@@ -245,3 +245,105 @@ EOF
     assert_output --partial "second and fourth parts must be 40 or 64 lowercase hexits"
     refute_output --partial "panicked"
 }
+
+_write_large_files_config() {
+    cat <<EOF > hk.pkl
+amends "$PKL_PATH/Config.pkl"
+
+hooks {
+    ["pre-push"] {
+        steps {
+            ["check-added-large-files"] {
+                check = "hk util check-added-large-files --from-ref {{from_ref}} --to-ref {{to_ref}} {{files}}"
+                glob = "**/*"
+            }
+        }
+    }
+}
+EOF
+}
+
+@test "pre-push new-branch push passes a modified pre-existing large file" {
+    # A first push of a new branch whose range only modifies a large file the
+    # remote already carries: hk picks the base the remote shares history with
+    # and the guard judges only files the push adds, so this must not veto.
+    export NO_COLOR=1
+    if [ "$HK_LIBGIT2" = "0" ]; then
+        skip "libgit2 is not installed"
+    fi
+    _write_large_files_config
+    yes "some text line" | head -c 513000 > big.txt
+    git add hk.pkl big.txt
+    git commit -qm "add big.txt"
+    git push -q origin main
+    hk install --legacy
+
+    git checkout -qb feature/big-modification
+    printf 'more\n' >> big.txt
+    git add big.txt
+    git commit -qm "modify big.txt"
+
+    HK_LOG=trace run git push -u origin feature/big-modification
+    assert_success
+    refute_output --partial "big.txt"
+}
+
+@test "pre-push new-branch push still blocks a large file it adds" {
+    # The scoping must not weaken the guard: a large file the pushed range
+    # adds is new on the remote and still vetoes the push.
+    export NO_COLOR=1
+    if [ "$HK_LIBGIT2" = "0" ]; then
+        skip "libgit2 is not installed"
+    fi
+    _write_large_files_config
+    echo "small" > small.txt
+    git add hk.pkl small.txt
+    git commit -qm "add small.txt"
+    git push -q origin main
+    hk install --legacy
+
+    git checkout -qb feature/big-addition
+    yes "other text line" | head -c 513000 > big-new.txt
+    git add big-new.txt
+    git commit -qm "add big-new.txt"
+
+    HK_LOG=trace run git push -u origin feature/big-addition
+    assert_failure
+    assert_output --partial "big-new.txt"
+}
+
+@test "pre-push new-branch push scopes a file step to the pushed range" {
+    # hk fills {{from_ref}}/{{to_ref}} from the refs git hands pre-push. On a
+    # new-branch first push the base is the remote ref the remote already has
+    # (the remote sha is all-zeros), so the step sees the pushed range, not
+    # the whole default-branch diff.
+    export NO_COLOR=1
+    if [ "$HK_LIBGIT2" = "0" ]; then
+        skip "libgit2 is not installed"
+    fi
+    cat <<EOF > hk.pkl
+amends "$PKL_PATH/Config.pkl"
+hooks {
+    ["pre-push"] {
+        steps {
+            ["print-files"] { check = "echo \"{{from_ref}} {{to_ref}} {{files}}\"" }
+        }
+    }
+}
+EOF
+    echo "content" > ranged.txt
+    git add hk.pkl ranged.txt
+    git commit -qm "install hk"
+    git push -q origin main
+    hk install --legacy
+
+    git checkout -qb feature/range-print
+    printf 'more\n' >> ranged.txt
+    git add ranged.txt
+    git commit -qm "modify ranged.txt"
+
+    run git push -u origin feature/range-print
+    assert_success
+    assert_output --partial "refs/remotes/origin/main"
+    assert_output --partial "ranged.txt"
+}

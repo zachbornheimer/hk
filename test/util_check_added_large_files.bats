@@ -52,3 +52,57 @@ HK
     run hk check
     assert_success
 }
+
+@test "check_added_large_files - range mode passes a modified pre-existing large file" {
+    # A new branch that only modifies a large file the base tree already
+    # carries must not be vetoed: the push introduces nothing at that path.
+    yes "some text line" | head -c 513000 > big.txt
+    git add -A
+    git commit -qm "add big.txt"
+    git checkout -qb feature
+    printf 'more\n' >> big.txt
+    git add -A
+    git commit -qm "modify big.txt"
+
+    run hk util check-added-large-files --from-ref main --to-ref HEAD big.txt
+    assert_success
+    refute_output --partial "big.txt"
+}
+
+@test "check_added_large_files - range mode fails a large file the range adds" {
+    yes "some text line" | head -c 513000 > big.txt
+    git add -A
+    git commit -qm "add big.txt"
+    git checkout -qb feature
+    yes "other text line" | head -c 513000 > big-new.txt
+    git add -A
+    git commit -qm "add big-new.txt"
+
+    run hk util check-added-large-files --from-ref main --to-ref HEAD big.txt big-new.txt
+    assert_failure
+    assert_output --partial "big-new.txt"
+    refute_output --partial "big.txt"
+}
+
+@test "check_added_large_files - range mode passes when the range adds no large file" {
+    yes "some text line" | head -c 513000 > big.txt
+    git add -A
+    git commit -qm "add big.txt"
+    git checkout -qb feature
+    echo "small" > small.txt
+    git add -A
+    git commit -qm "add small.txt"
+
+    run hk util check-added-large-files --from-ref main --to-ref HEAD big.txt small.txt
+    assert_success
+}
+
+@test "check_added_large_files - unresolvable from-ref checks every given file" {
+    # A base ref that cannot be resolved is a fallback, not a silent pass:
+    # every given file is checked, the range-less behavior.
+    yes "some text line" | head -c 513000 > big.txt
+
+    run hk util check-added-large-files --from-ref no-such-ref --to-ref HEAD big.txt
+    assert_failure
+    assert_output --partial "big.txt"
+}

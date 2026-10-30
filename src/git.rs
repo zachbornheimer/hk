@@ -240,7 +240,7 @@ where
 /// Runs git and splits its NUL-separated output into paths, keeping names
 /// that are not valid UTF-8 as they are. Reading the output as a `String`
 /// would cut it short at such a name or replace its bytes.
-fn git_read_raw_paths<I, S>(args: I) -> Result<Vec<PathBuf>>
+pub(crate) fn git_read_raw_paths<I, S>(args: I) -> Result<Vec<PathBuf>>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -1342,6 +1342,54 @@ impl Git {
             }
         }
         Ok(None)
+    }
+
+    /// The remote-tracking ref of `remote` that shares the most history with
+    /// `head`: the one whose merge-base with `head` is the closest to it.
+    ///
+    /// A first push of a ref the remote does not have yet uploads the commits
+    /// after that merge-base, so that ref is the best local answer to "what
+    /// does this remote already have" when picking a base to diff against.
+    /// `Ok(None)` when the remote has no remote-tracking refs sharing history
+    /// with `head`, or when libgit2 is unavailable.
+    pub fn closest_remote_tracking_ref(&self, remote: &str, head: &str) -> Result<Option<String>> {
+        let Some(repo) = &self.repo else {
+            return Ok(None);
+        };
+        let head_commit = repo
+            .revparse_single(head)
+            .wrap_err(format!("Failed to parse reference: {head}"))?
+            .peel_to_commit()
+            .wrap_err(format!("Failed to get commit for reference: {head}"))?;
+        let prefix = format!("refs/remotes/{remote}/");
+        // Every merge-base is an ancestor of `head`, so the candidates are
+        // totally ordered by ancestry: keep the one all the others are
+        // ancestors of, which is the one closest to `head`.
+        let mut closest: Option<(git2::Oid, String)> = None;
+        for reference in repo.references()?.flatten() {
+            let Some(name) = reference.name().ok().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let Ok(target) = reference.peel_to_commit() else {
+                // A symbolic ref pointing at a ref this clone lacks
+                continue;
+            };
+            let Ok(merge_base) = repo.merge_base(head_commit.id(), target.id()) else {
+                // No shared history with this ref
+                continue;
+            };
+            let closer = closest.as_ref().is_none_or(|(current, _)| {
+                repo.merge_base(*current, merge_base)
+                    .is_ok_and(|common| common == *current)
+            });
+            if closer {
+                closest = Some((merge_base, name));
+            }
+        }
+        Ok(closest.map(|(_, name)| name))
     }
 
     pub fn current_branch(&self) -> Result<Option<String>> {

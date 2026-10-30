@@ -156,11 +156,20 @@ impl PrePush {
             None => {
                 // Either no refs were provided on stdin, or the first ref is
                 // a new-branch push (remote sha is all-zeros). Fall back to
-                // the remote-tracking branch if it exists, then to the
-                // repository's default branch on the target remote.
+                // the closest remote-tracking ref of this remote — the one
+                // sharing the most history with what is being pushed, since
+                // the push only uploads the commits after that merge-base —
+                // then to the remote-tracking branch of the current branch,
+                // then to the repository's default branch on the target remote.
                 let remote = self.remote.as_deref().unwrap_or("origin");
                 let repo = Git::new()?; // TODO: remove this extra repo creation
-                if let Some(rb) = repo.matching_remote_branch(remote)? {
+                let head = to_be_updated_refs
+                    .first()
+                    .map(|refs| refs.to.1.clone())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                if let Some(rb) = repo.closest_remote_tracking_ref(remote, &head)? {
+                    rb
+                } else if let Some(rb) = repo.matching_remote_branch(remote)? {
                     rb
                 } else if remote == "origin" {
                     repo.resolve_default_branch()
@@ -190,6 +199,14 @@ impl PrePush {
                 })
                 .unwrap_or("HEAD".to_string()),
         );
+        // The range this push was scoped to, so a step command can diff
+        // against it, e.g. `hk util check-added-large-files --from-ref
+        // {{from_ref}} --to-ref {{to_ref}}` — which judges only files the
+        // push adds, not the ones the remote already carries at size.
+        let from_ref = self.hook.from_ref.clone().unwrap_or_default();
+        let to_ref = self.hook.to_ref.clone().unwrap_or_default();
+        self.hook.insert_hook_var("from_ref", &from_ref);
+        self.hook.insert_hook_var("to_ref", &to_ref);
         debug!(
             "from_ref: {}, to_ref: {}",
             self.hook.from_ref.as_ref().unwrap(),
