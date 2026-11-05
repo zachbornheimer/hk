@@ -19,38 +19,73 @@ set -euo pipefail
 # Installing every stub's tool here, in one mise process before bats starts,
 # leaves the parallel tests with a fully populated installs directory and nothing
 # to write.
+#
+# A stub can also declare tool options, which mise passes to the tool's backend
+# and which join the install identity: ansible-lint pins `python`, so its stub
+# resolves `python@3.14` beside the tool and installs under `<version>~uv~<hash>`
+# rather than `<version>`. `mise install tool@version` carries no options and
+# cannot produce that identity, so the batch below would leave behind an install
+# the stub does not use, and the first test to run the stub would install the
+# tool again: for ansible-lint that is ninety seconds of uv work, repeated by
+# each of the three cases that run at once, which starves the rest of the suite
+# (the ten-second per-test timeout in test/depends.bats included). mise installs
+# a stub's tool the first time the stub runs, so a stub that declares tool
+# options is provisioned by running it instead.
 
 cd "${MISE_PROJECT_ROOT:-$(dirname "$0")/../../..}"
 
-specs=$(
-    for stub in test/builtin_tool_stubs*/*; do
-        [ -f "$stub" ] || continue
-        tool=$(sed -n 's/^tool *= *"\(.*\)"$/\1/p' "$stub" | head -1)
-        version=$(sed -n 's/^version *= *"\(.*\)"$/\1/p' "$stub" | head -1)
-        if [ -z "$tool" ] || [ -z "$version" ]; then
-            echo "error: $stub does not declare both tool and version" >&2
-            exit 1
-        fi
-        echo "$tool@$version"
-    done | sort -u
-)
-
-if [ -z "$specs" ]; then
-    echo "error: no tool stubs found under test/builtin_tool_stubs*/" >&2
-    exit 1
-fi
+# The keys mise reads from the stub itself and so does not hand to the backend
+# as a tool option; every other key is one.
+# https://mise.jdx.dev/dev-tools/tool-stubs.html
+stub_keys='^(tool|version|bin|os|install_env|url|checksum|size)$'
 
 # Not `mapfile`: macOS ships bash 3.2, which does not have it.
+specs=()
+option_stubs=()
+for stub in test/builtin_tool_stubs*/*; do
+	[ -f "$stub" ] || continue
+	tool=$(sed -n 's/^tool *= *"\(.*\)"$/\1/p' "$stub" | head -1)
+	version=$(sed -n 's/^version *= *"\(.*\)"$/\1/p' "$stub" | head -1)
+	if [ -z "$tool" ] || [ -z "$version" ]; then
+		echo "error: $stub does not declare both tool and version" >&2
+		exit 1
+	fi
+	if sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\) *=.*$/\1/p' "$stub" | grep -qvE "$stub_keys"; then
+		option_stubs+=("$stub")
+	else
+		specs+=("$tool@$version")
+	fi
+done
+
+if [ ${#specs[@]} -eq 0 ] && [ ${#option_stubs[@]} -eq 0 ]; then
+	echo "error: no tool stubs found under test/builtin_tool_stubs*/" >&2
+	exit 1
+fi
+
+# Two stubs can name the same tool at the same version; mise installs each
+# spec once either way, but a shorter batch is easier to read in the log.
 tools=()
-while IFS= read -r spec; do
-    tools+=("$spec")
-done <<<"$specs"
+if [ ${#specs[@]} -gt 0 ]; then
+	while IFS= read -r spec; do
+		tools+=("$spec")
+	done < <(printf '%s\n' "${specs[@]}" | sort -u)
+fi
 
 # Best effort: mise attempts every tool in the batch and names the ones it could
 # not install, so a tool that is unavailable on this machine (no ruby for the
 # `gem:` backend, say) costs only its own builtin test, exactly as it does today.
 # Failing the whole task here would take the unrelated .bats files down with it.
-if ! mise install "${tools[@]}"; then
-    echo "warning: some builtin tool stubs could not be preinstalled (see above);" >&2
-    echo "         their tests will install them lazily and may flake under parallelism" >&2
+if [ ${#tools[@]} -gt 0 ] && ! mise install "${tools[@]}"; then
+	echo "warning: some builtin tool stubs could not be preinstalled (see above);" >&2
+	echo "         their tests will install them lazily and may flake under parallelism" >&2
+fi
+
+# `--version` asks for the one thing a linter can answer without touching the
+# working tree. A tool that does not accept it has still been installed by the
+# time it runs, which is the point; a failed install still names itself on
+# stderr.
+if [ ${#option_stubs[@]} -gt 0 ]; then
+	for stub in "${option_stubs[@]}"; do
+		mise tool-stub "$stub" --version >/dev/null || true
+	done
 fi
