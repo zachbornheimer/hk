@@ -3,6 +3,8 @@ name: fork-sync
 # This branch (`fork`) holds only this caller. `main` mirrors upstream and only ever
 # fast-forwards; contributions are topic branches cut from it. Nothing here builds or releases.
 on:
+  push:
+    branches: [fork]
   schedule:
     - cron: "17 6,18 * * *"
   workflow_dispatch:
