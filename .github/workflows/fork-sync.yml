@@ -1,0 +1,24 @@
+name: fork-sync
+
+# This branch (`fork`) holds only this caller. `main` mirrors upstream and only ever
+# fast-forwards; contributions are topic branches cut from it. Nothing here builds or releases.
+on:
+  schedule:
+    - cron: "17 6,18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    uses: zysys/github-workflows/.github/workflows/fork-sync.yml@414875a0e71a25c7342b45b430a47b8c1bf9be3c # 414875a0e71a25c7342b45b430a47b8c1bf9be3c
+    permissions:
+      contents: write
+    with:
+      scripts_ref: 414875a0e71a25c7342b45b430a47b8c1bf9be3c
+      mirror: main
